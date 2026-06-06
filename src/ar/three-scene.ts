@@ -3,21 +3,27 @@ import { ARButton } from 'three/examples/jsm/webxr/ARButton.js';
 import { getElement } from '../dom.js';
 import { createSloth } from './sloth-model.js';
 
-const videoEl    = getElement<HTMLVideoElement>('camera');
-const canvasEl   = getElement<HTMLCanvasElement>('three-canvas');
-const camErrEl   = getElement<HTMLDivElement>('camera-error');
-const arHintEl   = getElement<HTMLDivElement>('ar-hint');
-const hudEl      = getElement<HTMLDivElement>('hud');
+const videoEl  = getElement<HTMLVideoElement>('camera');
+const canvasEl = getElement<HTMLCanvasElement>('three-canvas');
+const camErrEl = getElement<HTMLDivElement>('camera-error');
+const hudEl    = getElement<HTMLDivElement>('hud');
+
+// Camera-overlay ("magic window") sloth placement — approx 2 m ahead
+const OVERLAY_Z     = -2.2;
+const OVERLAY_Y     = -0.4;
+const OVERLAY_SCALE = 0.9;
+
+// WebXR immersive-ar sloth placement — real world metres
+const XR_Z     = -2;
+const XR_Y     = -0.4;
+const XR_SCALE = 0.45;
 
 let renderer: THREE.WebGLRenderer | null = null;
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
 let clock: THREE.Clock;
 let slothGroup: THREE.Group;
-let reticle: THREE.Group;
-let hitTestSource: XRHitTestSource | null = null;
-let slothPlaced  = false;
-let initialised  = false; // guard against double-tap before init completes
+let initialised = false;
 
 /** Entry point — lazily initialised on first AR screen entry, resumed on subsequent ones. */
 export async function enterARScene(): Promise<void> {
@@ -53,9 +59,8 @@ async function initThree(): Promise<void> {
   resizeRenderer();
 
   scene  = new THREE.Scene();
+  // Camera at origin looking down −Z; sloth lives at OVERLAY_Z in front.
   camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 100);
-  camera.position.set(0, 0.6, 4.5);
-  camera.lookAt(0, 0, 0);
 
   scene.add(new THREE.AmbientLight(0xffffff, 1.4));
   const sun = new THREE.DirectionalLight(0xfff4e0, 2.2);
@@ -66,96 +71,45 @@ async function initThree(): Promise<void> {
   scene.add(fill);
 
   slothGroup = createSloth();
-  slothGroup.position.set(0, -0.4, 0);
-  slothGroup.userData['baseY'] = -0.4;
+  placeSlothOverlay();
   scene.add(slothGroup);
 
-  // ── Reticle (AR surface indicator) ──
-  const reticleGroup = new THREE.Group();
-
-  const ringGeo = new THREE.RingGeometry(0.09, 0.13, 36);
-  ringGeo.rotateX(-Math.PI / 2);
-  const ring = new THREE.Mesh(
-    ringGeo,
-    new THREE.MeshBasicMaterial({
-      color:       0x44ff88,
-      side:        THREE.DoubleSide,
-      transparent: true,
-      opacity:     0.9,
-    }),
-  );
-  reticleGroup.add(ring);
-
-  const crossMat = new THREE.MeshBasicMaterial({ color: 0x44ff88, transparent: true, opacity: 0.7 });
-  const barGeo   = new THREE.BoxGeometry(0.18, 0.004, 0.01);
-
-  const cH = new THREE.Mesh(barGeo, crossMat);
-  cH.rotation.x = -Math.PI / 2;
-  const cV = new THREE.Mesh(barGeo, crossMat);
-  cV.rotation.x = -Math.PI / 2;
-  cV.rotation.z = Math.PI / 2;
-  reticleGroup.add(cH, cV);
-
-  reticle = reticleGroup;
-  reticle.matrixAutoUpdate = false;
-  reticle.visible = false;
-  scene.add(reticle);
-
-  // AR or getUserMedia fallback
-  const arSupported = await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false) ?? false;
-  if (arSupported) {
-    setupAR();
-  } else {
-    await startCamera();
-  }
-
+  // ── Step 1: autostart camera overlay — guaranteed to run ─────────────────
+  await startCamera();
   renderer.setAnimationLoop(onFrame);
   window.addEventListener('resize', resizeRenderer);
+
+  // ── Step 2: optional WebXR button — failure never affects the overlay ─────
+  try {
+    const arSupported =
+      await (navigator.xr?.isSessionSupported('immersive-ar') ?? Promise.resolve(false)).catch(
+        () => false,
+      );
+    if (arSupported) setupAR();
+  } catch {
+    // WebXR probe failed — camera overlay continues unaffected
+  }
 }
 
 // ── Main animation loop ───────────────────────────────────────────────────────
 
-function onFrame(_time: number, frame: XRFrame | undefined): void {
+function onFrame(_time: number, _frame: XRFrame | undefined): void {
   const dt = clock.getDelta();
   const t  = clock.elapsedTime;
 
-  if (frame != null && hitTestSource != null) {
-    const refSpace = renderer!.xr.getReferenceSpace();
-    if (refSpace != null) {
-      const results = frame.getHitTestResults(hitTestSource);
-
-      if (results.length > 0 && !slothPlaced) {
-        const pose = results[0]?.getPose(refSpace);
-        if (pose != null) {
-          reticle.visible = true;
-          reticle.matrix.fromArray(pose.transform.matrix);
-          const s = 1 + Math.sin(t * 6) * 0.08;
-          reticle.scale.set(s, 1, s);
-          arHintEl.classList.remove('hidden');
-        }
-      } else {
-        reticle.visible = false;
-        if (!slothPlaced) arHintEl.classList.add('hidden');
-      }
-    }
-  }
-
   if (slothGroup.visible) {
     slothGroup.rotation.y += dt * 0.55;
-    if (!slothPlaced) {
-      const baseY = slothGroup.userData['baseY'] as number;
-      slothGroup.position.y = baseY + Math.sin(t * 1.3) * 0.09;
-    }
+    const baseY = slothGroup.userData['baseY'] as number;
+    slothGroup.position.y = baseY + Math.sin(t * 1.3) * 0.09;
   }
 
   renderer!.render(scene, camera);
 }
 
-// ── AR path ───────────────────────────────────────────────────────────────────
+// ── WebXR (optional progressive enhancement) ──────────────────────────────────
 
 function setupAR(): void {
   const arBtn = ARButton.createButton(renderer!, {
-    requiredFeatures: ['hit-test'],
     optionalFeatures: ['dom-overlay'],
     domOverlay:       { root: hudEl },
   });
@@ -178,50 +132,36 @@ function setupAR(): void {
     zIndex:        '20',
     pointerEvents: 'auto',
   } satisfies Partial<CSSStyleDeclaration>);
-  // vendor-prefixed property set via setProperty to satisfy strict typing
   arBtn.style.setProperty('-webkit-tap-highlight-color', 'transparent');
 
   hudEl.appendChild(arBtn);
 
-  renderer!.xr.addEventListener('sessionstart', () => { void onARSessionStart(); });
+  renderer!.xr.addEventListener('sessionstart', onARSessionStart);
   renderer!.xr.addEventListener('sessionend',   onARSessionEnd);
 }
 
-async function onARSessionStart(): Promise<void> {
-  const session   = renderer!.xr.getSession()!;
-  const viewerRef = await session.requestReferenceSpace('viewer');
-  hitTestSource   = await session.requestHitTestSource?.({ space: viewerRef }) ?? null;
-
-  slothGroup.scale.setScalar(0.45);
-  slothGroup.userData['baseY'] = 0;
-  slothPlaced = false;
-
-  session.addEventListener('select', onARSelect);
+function onARSessionStart(): void {
+  // Auto-place sloth 2 real metres ahead; no tap-to-place needed
+  slothGroup.position.set(0, XR_Y, XR_Z);
+  slothGroup.userData['baseY'] = XR_Y;
+  slothGroup.scale.setScalar(XR_SCALE);
+  slothGroup.rotation.y = Math.random() * Math.PI * 2;
   if (videoEl.srcObject != null) videoEl.pause();
 }
 
 function onARSessionEnd(): void {
-  hitTestSource?.cancel?.();
-  hitTestSource = null;
-  reticle.visible = false;
-  arHintEl.classList.add('hidden');
-  slothGroup.scale.setScalar(1);
-  slothGroup.userData['baseY'] = -0.4;
-  slothGroup.position.set(0, -0.4, 0);
-  slothPlaced = false;
+  placeSlothOverlay();
+  if (videoEl.srcObject != null) void videoEl.play().catch(() => {});
 }
 
-function onARSelect(): void {
-  if (!reticle.visible || slothPlaced) return;
-  slothGroup.position.setFromMatrixPosition(reticle.matrix);
-  slothGroup.userData['baseY'] = slothGroup.position.y;
-  slothGroup.rotation.y        = Math.random() * Math.PI * 2;
-  slothPlaced                  = true;
-  reticle.visible              = false;
-  arHintEl.classList.add('hidden');
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-// ── getUserMedia fallback ─────────────────────────────────────────────────────
+/** Reset the sloth to camera-overlay (magic-window) position. */
+function placeSlothOverlay(): void {
+  slothGroup.position.set(0, OVERLAY_Y, OVERLAY_Z);
+  slothGroup.userData['baseY'] = OVERLAY_Y;
+  slothGroup.scale.setScalar(OVERLAY_SCALE);
+}
 
 async function startCamera(): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -234,7 +174,7 @@ async function startCamera(): Promise<void> {
       audio: false,
     });
     videoEl.srcObject = stream;
-    await videoEl.play().catch(() => {}); // explicit play required after srcObject assignment
+    await videoEl.play().catch(() => {});
   } catch (err) {
     console.warn('Camera:', err instanceof Error ? err.message : err);
     camErrEl.classList.remove('hidden');
