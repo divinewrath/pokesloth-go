@@ -136,6 +136,10 @@ function setupAR(): void {
 
   hudEl.appendChild(arBtn);
 
+  // Stop the getUserMedia stream before WebXR requests the camera — otherwise
+  // the two compete for the same hardware and the session hangs.
+  arBtn.addEventListener('click', stopCameraStream, true);
+
   renderer!.xr.addEventListener('sessionstart', onARSessionStart);
   renderer!.xr.addEventListener('sessionend',   onARSessionEnd);
 }
@@ -151,7 +155,7 @@ function onARSessionStart(): void {
 
 function onARSessionEnd(): void {
   placeSlothOverlay();
-  if (videoEl.srcObject != null) void videoEl.play().catch(() => {});
+  void startCamera(); // restart the getUserMedia stream after WebXR releases the camera
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -161,6 +165,13 @@ function placeSlothOverlay(): void {
   slothGroup.position.set(0, OVERLAY_Y, OVERLAY_Z);
   slothGroup.userData['baseY'] = OVERLAY_Y;
   slothGroup.scale.setScalar(OVERLAY_SCALE);
+}
+
+function stopCameraStream(): void {
+  if (videoEl.srcObject instanceof MediaStream) {
+    videoEl.srcObject.getTracks().forEach(t => t.stop());
+    videoEl.srcObject = null;
+  }
 }
 
 async function startCamera(): Promise<void> {
