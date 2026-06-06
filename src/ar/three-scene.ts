@@ -6,6 +6,7 @@ import { createSloth } from './sloth-model.js';
 const videoEl  = getElement<HTMLVideoElement>('camera');
 const canvasEl = getElement<HTMLCanvasElement>('three-canvas');
 const camErrEl = getElement<HTMLDivElement>('camera-error');
+const arHintEl = getElement<HTMLDivElement>('ar-hint');
 const hudEl    = getElement<HTMLDivElement>('hud');
 
 // Camera-overlay ("magic window") sloth placement — approx 2 m ahead
@@ -13,9 +14,7 @@ const OVERLAY_Z     = -2.2;
 const OVERLAY_Y     = -0.4;
 const OVERLAY_SCALE = 0.585; // 0.9 × 0.65
 
-// WebXR immersive-ar sloth placement — real world metres
-const XR_Z     = -2;
-const XR_Y     = -0.4;
+// WebXR immersive-ar sloth scale — real world metres
 const XR_SCALE = 0.2925; // 0.45 × 0.65
 
 let renderer: THREE.WebGLRenderer | null = null;
@@ -23,7 +22,13 @@ let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera | null = null;
 let clock: THREE.Clock;
 let slothGroup: THREE.Group;
+let crossGroup: THREE.Group;
+let hitTestSource: XRHitTestSource | null = null;
 let initialised = false;
+
+// Scratch objects — allocated once to avoid per-frame GC pressure
+const _hitMatrix = new THREE.Matrix4();
+const _v3        = new THREE.Vector3();
 
 /** Entry point — lazily initialised on first AR screen entry, resumed on subsequent ones. */
 export async function enterARScene(): Promise<void> {
@@ -74,6 +79,10 @@ async function initThree(): Promise<void> {
   placeSlothOverlay();
   scene.add(slothGroup);
 
+  crossGroup = buildCross();
+  crossGroup.visible = false;
+  scene.add(crossGroup);
+
   // ── Step 1: autostart camera overlay — guaranteed to run ─────────────────
   await startCamera();
   renderer.setAnimationLoop(onFrame);
@@ -93,14 +102,49 @@ async function initThree(): Promise<void> {
 
 // ── Main animation loop ───────────────────────────────────────────────────────
 
-function onFrame(_time: number, _frame: XRFrame | undefined): void {
+function onFrame(_time: number, frame: XRFrame | undefined): void {
   const dt = clock.getDelta();
   const t  = clock.elapsedTime;
 
-  if (slothGroup.visible) {
-    slothGroup.rotation.y += dt * 0.55;
-    const baseY = slothGroup.userData['baseY'] as number;
-    slothGroup.position.y = baseY + Math.sin(t * 1.3) * 0.09;
+  if (frame != null) {
+    // ── WebXR immersive session ──────────────────────────────────────────────
+    const refSpace = renderer!.xr.getReferenceSpace();
+
+    if (hitTestSource != null && refSpace != null) {
+      const results = frame.getHitTestResults(hitTestSource);
+
+      if (results.length > 0) {
+        const pose = results[0]?.getPose(refSpace);
+        if (pose != null) {
+          // Flat surface found — snap sloth to it
+          _hitMatrix.fromArray(pose.transform.matrix);
+          slothGroup.position.setFromMatrixPosition(_hitMatrix);
+          slothGroup.visible = true;
+          crossGroup.visible = false;
+          arHintEl.classList.add('hidden');
+        }
+      } else {
+        // No surface in view — float red cross in front of viewer
+        slothGroup.visible = false;
+        crossGroup.visible = true;
+        positionInFrontOfViewer(crossGroup);
+        arHintEl.classList.remove('hidden');
+      }
+    } else {
+      // hit-test source not ready yet — show cross while initialising
+      crossGroup.visible = true;
+      slothGroup.visible = false;
+      positionInFrontOfViewer(crossGroup);
+    }
+
+    if (slothGroup.visible) slothGroup.rotation.y += dt * 0.55;
+  } else {
+    // ── Camera overlay mode ──────────────────────────────────────────────────
+    if (slothGroup.visible) {
+      slothGroup.rotation.y += dt * 0.55;
+      const baseY = slothGroup.userData['baseY'] as number;
+      slothGroup.position.y = baseY + Math.sin(t * 1.3) * 0.09;
+    }
   }
 
   renderer!.render(scene, camera!);
@@ -110,13 +154,14 @@ function onFrame(_time: number, _frame: XRFrame | undefined): void {
 
 function setupAR(): void {
   const arBtn = ARButton.createButton(renderer!, {
+    requiredFeatures: ['hit-test'],
     optionalFeatures: ['dom-overlay'],
     domOverlay:       { root: hudEl },
   });
 
   Object.assign(arBtn.style, {
     position:      'absolute',
-    bottom:        '40px',
+    bottom:        '100px',
     left:          '50%',
     transform:     'translateX(-50%)',
     padding:       '14px 40px',
@@ -140,31 +185,62 @@ function setupAR(): void {
   // the two compete for the same hardware and the session hangs.
   arBtn.addEventListener('click', stopCameraStream, true);
 
-  renderer!.xr.addEventListener('sessionstart', onARSessionStart);
+  renderer!.xr.addEventListener('sessionstart', () => { void onARSessionStart(); });
   renderer!.xr.addEventListener('sessionend',   onARSessionEnd);
 }
 
-function onARSessionStart(): void {
-  // Auto-place sloth 2 real metres ahead; no tap-to-place needed
-  slothGroup.position.set(0, XR_Y, XR_Z);
-  slothGroup.userData['baseY'] = XR_Y;
+async function onARSessionStart(): Promise<void> {
+  const session   = renderer!.xr.getSession()!;
+  const viewerRef = await session.requestReferenceSpace('viewer');
+  hitTestSource   = await session.requestHitTestSource?.({ space: viewerRef }) ?? null;
+
   slothGroup.scale.setScalar(XR_SCALE);
-  slothGroup.rotation.y = Math.random() * Math.PI * 2;
+  slothGroup.visible = false;
+  crossGroup.visible = true;
+
+  arHintEl.textContent = 'Point at a flat surface';
+  arHintEl.classList.remove('hidden');
+
   if (videoEl.srcObject != null) videoEl.pause();
 }
 
 function onARSessionEnd(): void {
+  hitTestSource?.cancel?.();
+  hitTestSource = null;
+  crossGroup.visible = false;
+  arHintEl.classList.add('hidden');
   placeSlothOverlay();
-  void startCamera(); // restart the getUserMedia stream after WebXR releases the camera
+  void startCamera(); // restart getUserMedia stream after WebXR releases camera
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Reset the sloth to camera-overlay (magic-window) position. */
+function buildCross(): THREE.Group {
+  const mat    = new THREE.MeshBasicMaterial({ color: 0xff2222, depthTest: false });
+  const barGeo = new THREE.BoxGeometry(0.35, 0.05, 0.05);
+  const bar1   = new THREE.Mesh(barGeo, mat);
+  bar1.rotation.z = Math.PI / 4;
+  const bar2 = new THREE.Mesh(barGeo, mat);
+  bar2.rotation.z = -Math.PI / 4;
+  const group = new THREE.Group();
+  group.add(bar1, bar2);
+  return group;
+}
+
+/** Move a group to ~1.5 m in front of and slightly below the XR viewer each frame. */
+function positionInFrontOfViewer(target: THREE.Group): void {
+  const xrCam = renderer!.xr.getCamera();
+  _v3.set(0, -0.2, -1.5).applyQuaternion(xrCam.quaternion);
+  target.position.copy(xrCam.position).add(_v3);
+  target.quaternion.copy(xrCam.quaternion);
+}
+
+/** Reset the sloth to camera-overlay (magic-window) position and make it visible. */
 function placeSlothOverlay(): void {
   slothGroup.position.set(0, OVERLAY_Y, OVERLAY_Z);
   slothGroup.userData['baseY'] = OVERLAY_Y;
   slothGroup.scale.setScalar(OVERLAY_SCALE);
+  slothGroup.visible = true;
 }
 
 function stopCameraStream(): void {
