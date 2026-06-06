@@ -23,7 +23,14 @@ let initialised  = false; // guard against double-tap before init completes
 export async function enterARScene(): Promise<void> {
   if (!initialised) {
     initialised = true;
-    await initThree();
+    try {
+      await initThree();
+    } catch (err) {
+      initialised = false; // allow retry on next entry
+      console.error('AR init error:', err);
+      camErrEl.textContent = '⚠️ AR unavailable';
+      camErrEl.classList.remove('hidden');
+    }
   } else {
     renderer?.setAnimationLoop(onFrame);
   }
@@ -227,6 +234,7 @@ async function startCamera(): Promise<void> {
       audio: false,
     });
     videoEl.srcObject = stream;
+    await videoEl.play().catch(() => {}); // explicit play required after srcObject assignment
   } catch (err) {
     console.warn('Camera:', err instanceof Error ? err.message : err);
     camErrEl.classList.remove('hidden');
