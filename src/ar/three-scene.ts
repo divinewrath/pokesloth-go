@@ -11,16 +11,16 @@ const hudEl    = getElement<HTMLDivElement>('hud');
 // Camera-overlay ("magic window") sloth placement — approx 2 m ahead
 const OVERLAY_Z     = -2.2;
 const OVERLAY_Y     = -0.4;
-const OVERLAY_SCALE = 0.9;
+const OVERLAY_SCALE = 0.585; // 0.9 × 0.65
 
 // WebXR immersive-ar sloth placement — real world metres
 const XR_Z     = -2;
 const XR_Y     = -0.4;
-const XR_SCALE = 0.45;
+const XR_SCALE = 0.2925; // 0.45 × 0.65
 
 let renderer: THREE.WebGLRenderer | null = null;
 let scene: THREE.Scene;
-let camera: THREE.PerspectiveCamera;
+let camera: THREE.PerspectiveCamera | null = null;
 let clock: THREE.Clock;
 let slothGroup: THREE.Group;
 let initialised = false;
@@ -56,11 +56,11 @@ async function initThree(): Promise<void> {
   renderer.setClearColor(0x000000, 0);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.xr.enabled = true;
-  resizeRenderer();
 
   scene  = new THREE.Scene();
   // Camera at origin looking down −Z; sloth lives at OVERLAY_Z in front.
   camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 100);
+  resizeRenderer(); // must come after camera is assigned
 
   scene.add(new THREE.AmbientLight(0xffffff, 1.4));
   const sun = new THREE.DirectionalLight(0xfff4e0, 2.2);
@@ -103,7 +103,7 @@ function onFrame(_time: number, _frame: XRFrame | undefined): void {
     slothGroup.position.y = baseY + Math.sin(t * 1.3) * 0.09;
   }
 
-  renderer!.render(scene, camera);
+  renderer!.render(scene, camera!);
 }
 
 // ── WebXR (optional progressive enhancement) ──────────────────────────────────
@@ -184,7 +184,7 @@ async function startCamera(): Promise<void> {
 // ── Resize ────────────────────────────────────────────────────────────────────
 
 function resizeRenderer(): void {
-  if (renderer == null) return;
+  if (renderer == null || camera == null) return;
   renderer.setSize(window.innerWidth, window.innerHeight);
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
