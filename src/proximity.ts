@@ -1,10 +1,13 @@
 import { getElement } from './dom.js';
+import { getCurrentScreen } from './screens.js';
 import type { SlothFeature } from './types.js';
-import { NEARBY_RADIUS_M } from './types.js';
+import { APPROACH_RADIUS_M, CATCH_RADIUS_M } from './types.js';
 
 const nearbyToastEl = getElement<HTMLDivElement>('nearby-toast');
+const arHintEl      = getElement<HTMLDivElement>('ar-hint');
 
-let prevNearbyCount = 0;
+let mapToastTimer: ReturnType<typeof window.setTimeout> | null = null;
+let arHintTimer:   ReturnType<typeof window.setTimeout> | null = null;
 
 /** Haversine distance in metres between two lat/lng points. */
 export function getDistanceM(
@@ -25,64 +28,71 @@ export function getDistanceM(
 }
 
 /**
- * Re-evaluates which sloths are within NEARBY_RADIUS_M of the player position.
- * Returns a new array with updated `nearby` properties.
- * Side-effects: updates the toast UI and fires haptic/chime when entering proximity.
+ * Split features into caught (≤ CATCH_RADIUS_M) and remaining.
+ * Remaining features have their `nearby` flag set based on APPROACH_RADIUS_M,
+ * which drives the golden aura layer on the map.
  */
-export function checkProximity(
+export function detectCatches(
   lat: number,
   lng: number,
   features: SlothFeature[],
-): SlothFeature[] {
-  if (features.length === 0) return features;
+): { remaining: SlothFeature[]; caught: SlothFeature[] } {
+  if (features.length === 0) return { remaining: [], caught: [] };
 
-  let nearbyCount = 0;
+  const remaining: SlothFeature[] = [];
+  const caught: SlothFeature[]    = [];
 
-  const updated: SlothFeature[] = features.map((f) => {
+  for (const f of features) {
     const [slothLng, slothLat] = f.geometry.coordinates as [number, number];
-    const dist   = getDistanceM(lat, lng, slothLat, slothLng);
-    const nearby = dist <= NEARBY_RADIUS_M;
-    if (nearby) nearbyCount++;
-    return { ...f, properties: { ...f.properties, nearby } };
-  });
-
-  if (nearbyCount > 0 && prevNearbyCount === 0) {
-    // Transition: none → some
-    signalNearbySloth(nearbyCount);
-  } else if (nearbyCount > prevNearbyCount && prevNearbyCount > 0) {
-    // Another sloth just entered range — update text, no repeated beep
-    nearbyToastEl.textContent = toastText(nearbyCount);
-  } else if (nearbyCount === 0 && prevNearbyCount > 0) {
-    // All out of range — dismiss
-    nearbyToastEl.classList.add('hidden');
+    const dist = getDistanceM(lat, lng, slothLat, slothLng);
+    if (dist <= CATCH_RADIUS_M) {
+      caught.push(f);
+    } else {
+      remaining.push({ ...f, properties: { ...f.properties, nearby: dist <= APPROACH_RADIUS_M } });
+    }
   }
 
-  prevNearbyCount = nearbyCount;
-  return updated;
+  return { remaining, caught };
+}
+
+/**
+ * Fires haptic + chime and shows a contextual catch message.
+ * Uses the map's nearby-toast on the map screen, the AR hint on the AR screen.
+ */
+export function signalCatch(count: number): void {
+  const text = count === 1 ? '🦥 Caught a sloth!' : `🦥 Caught ${count} sloths!`;
+
+  navigator.vibrate?.([180, 80, 180]);
+  playChime();
+
+  if (getCurrentScreen() === 'ar') {
+    arHintEl.textContent = text;
+    arHintEl.classList.remove('hidden');
+    if (arHintTimer != null) clearTimeout(arHintTimer);
+    arHintTimer = window.setTimeout(() => {
+      arHintEl.classList.add('hidden');
+      arHintTimer = null;
+    }, 2_500);
+  } else {
+    // Re-trigger the slide-up CSS animation by cycling the hidden class.
+    nearbyToastEl.textContent = text;
+    nearbyToastEl.classList.add('hidden');
+    void nearbyToastEl.offsetWidth; // flush layout so animation restarts
+    nearbyToastEl.classList.remove('hidden');
+    if (mapToastTimer != null) clearTimeout(mapToastTimer);
+    mapToastTimer = window.setTimeout(() => {
+      nearbyToastEl.classList.add('hidden');
+      mapToastTimer = null;
+    }, 3_000);
+  }
 }
 
 export function resetProximityState(): void {
-  prevNearbyCount = 0;
   nearbyToastEl.classList.add('hidden');
+  if (mapToastTimer != null) { clearTimeout(mapToastTimer); mapToastTimer = null; }
 }
 
-function toastText(count: number): string {
-  return count === 1
-    ? '🦥 Sloth nearby! Tap to encounter'
-    : `🦥 ${count} sloths nearby! Tap any to encounter`;
-}
-
-function signalNearbySloth(count: number): void {
-  nearbyToastEl.textContent = toastText(count);
-
-  // Re-trigger CSS slide-up animation by forcing a reflow
-  nearbyToastEl.classList.add('hidden');
-  void nearbyToastEl.offsetWidth; // flush layout so animation restarts
-  nearbyToastEl.classList.remove('hidden');
-
-  navigator.vibrate?.([180, 80, 180]); // double-pulse haptic (ignored on desktop)
-  playChime();
-}
+// ── Private ───────────────────────────────────────────────────────────────────
 
 function playChime(): void {
   try {

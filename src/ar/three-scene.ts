@@ -8,7 +8,7 @@ import {
   startDeviceOrientation,
   stopDeviceOrientation,
 } from './device-orientation.js';
-import type { GeoContext } from '../types.js';
+import type { GeoContext, SlothFeature } from '../types.js';
 
 const videoEl  = getElement<HTMLVideoElement>('camera');
 const canvasEl = getElement<HTMLCanvasElement>('three-canvas');
@@ -27,12 +27,19 @@ const XR_SCALE = 0.2925; // 0.45 × 0.65
 // Y height (world units) for geo-anchored sloths — just below eye level
 const FIELD_Y = -0.5;
 
+// Duration of the "caught" vanish animation in seconds
+const VANISH_DURATION = 0.4;
+
+// Lerp speed: entities move 3 units/s toward their GPS-updated target position.
+// GPS fires ~1 Hz; t = 3 means ~95 % of the way in 1 second.
+const LERP_SPEED = 3;
+
 let renderer: THREE.WebGLRenderer | null = null;
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera | null = null;
 let clock: THREE.Clock;
-let slothGroup: THREE.Group;    // single sloth: WebXR hit-test + overlay fallback
-let slothField: THREE.Group | null = null; // geo-anchored multi-sloth group
+let slothGroup: THREE.Group;   // single sloth: WebXR hit-test + overlay fallback
+let slothField: THREE.Group | null = null; // persistent container for geo entities
 let crossGroup: THREE.Group;
 let hitTestSource: XRHitTestSource | null = null;
 let initialised = false;
@@ -40,9 +47,16 @@ let initialised = false;
 let geoCtx: GeoContext | null = null;
 let orientationAvailable = false;
 
+/**
+ * Live entity map keyed by SlothProperties.id.
+ * Entities are children of slothField; their targetPos is updated every GPS tick.
+ */
+const entityById = new Map<number, THREE.Group>();
+
 // Scratch objects — allocated once to avoid per-frame GC pressure
-const _hitMatrix = new THREE.Matrix4();
-const _v3        = new THREE.Vector3();
+const _hitMatrix  = new THREE.Matrix4();
+const _v3         = new THREE.Vector3();
+const _targetPos  = new THREE.Vector3(); // reused in syncSlothField
 
 // ── Entry points ──────────────────────────────────────────────────────────────
 
@@ -72,18 +86,19 @@ export async function enterARScene(ctx: GeoContext): Promise<void> {
       return;
     }
   } else {
+    clock.getDelta(); // flush stale delta so first frame has a realistic dt
     renderer?.setAnimationLoop(onFrame);
   }
 
   // Seed with the overlay fallback immediately — user never sees an empty canvas.
-  buildSlothField();
+  syncSlothField();
 
   // Upgrade to geo-anchored sloths as soon as orientation confirms.
   orientationPromise
     .then((hasOrientation) => {
-      orientationAvailable = hasOrientation;
-      if (hasOrientation) {
-        buildSlothField();
+      if (hasOrientation) orientationAvailable = true; // only ever set, never cleared
+      if (orientationAvailable) {
+        syncSlothField();
       } else {
         // Hint only on mobile; desktop always lacks a compass so stay silent.
         const isMobile = /Mobi|Android/i.test(navigator.userAgent);
@@ -95,6 +110,17 @@ export async function enterARScene(ctx: GeoContext): Promise<void> {
       }
     })
     .catch(() => { /* orientation unavailable — overlay fallback stays */ });
+}
+
+/**
+ * Receive a live geo update from the map (called every GPS tick, ~1 Hz).
+ * Updates entity target positions and marks caught sloths as dying.
+ * Safe to call when AR is not open — state is stored for the next entry.
+ */
+export function updateARGeo(ctx: GeoContext): void {
+  geoCtx = ctx;
+  if (!initialised || !orientationAvailable) return;
+  syncSlothField();
 }
 
 /** Pause the render loop and compass listener (call when leaving the AR screen). */
@@ -197,14 +223,49 @@ function onFrame(_time: number, frame: XRFrame | undefined): void {
       camera!.quaternion.copy(getCameraQuaternion());
     }
 
-    if (slothField != null) {
-      // Animate each geo-anchored sloth model (first child of each entity group).
+    if (slothField != null && slothField.visible) {
+      // Tick each geo-anchored entity.
+      const toRemove: THREE.Group[] = [];
+
       for (const entity of slothField.children) {
-        const model = entity.children[0];
-        if (model == null) continue;
-        model.rotation.y += dt * 0.55;
-        const phase = (model.userData['phase'] as number | undefined) ?? 0;
-        model.position.y = Math.sin(t * 1.3 + phase) * 0.09;
+        const group = entity as THREE.Group;
+
+        const dying = group.userData['dying'] as boolean | undefined;
+        if (dying === true) {
+          // ── Vanish animation ──────────────────────────────────────────────
+          const elapsed = ((group.userData['dyingElapsed'] as number | undefined) ?? 0) + dt;
+          group.userData['dyingElapsed'] = elapsed;
+
+          const t01  = Math.min(elapsed / VANISH_DURATION, 1);
+          const base = (group.userData['originalScale'] as number | undefined) ?? OVERLAY_SCALE;
+          const model = group.children[0];
+          if (model != null) model.scale.setScalar(base * (1 - t01));
+
+          if (elapsed >= VANISH_DURATION) toRemove.push(group);
+          continue;
+        }
+
+        // ── Lerp toward GPS-updated target position ───────────────────────
+        const targetPos = group.userData['targetPos'] as THREE.Vector3 | undefined;
+        if (targetPos != null) {
+          group.position.lerp(targetPos, Math.min(dt * LERP_SPEED, 1));
+        }
+
+        // ── Per-sloth bob + spin ──────────────────────────────────────────
+        const model = group.children[0];
+        if (model != null) {
+          model.rotation.y += dt * 0.55;
+          const phase = (model.userData['phase'] as number | undefined) ?? 0;
+          model.position.y = Math.sin(t * 1.3 + phase) * 0.09;
+        }
+      }
+
+      // Deferred removal (mutates children, must be outside the loop above)
+      for (const dead of toRemove) {
+        const id = dead.userData['slothId'] as number | undefined;
+        if (id != null) entityById.delete(id);
+        slothField.remove(dead);
+        disposeGroup(dead);
       }
     } else if (slothGroup.visible) {
       // Fallback: single overlay sloth bobs in place.
@@ -220,62 +281,120 @@ function onFrame(_time: number, frame: XRFrame | undefined): void {
 // ── Geo-anchored sloth field ──────────────────────────────────────────────────
 
 /**
- * Rebuild the sloth scene from the current geo snapshot and orientation state.
+ * Incrementally sync the 3-D sloth field to the current geo snapshot.
  *
- * - Orientation available: creates one sloth per GeoContext entry, placed at
- *   the correct compass bearing and scene-clamped distance.
- * - Orientation unavailable (or no context): falls back to the single overlay
- *   sloth parked ~2 m in front of the camera.
+ * - Orientation available: ensures `slothField` exists, upserts an entity per
+ *   sloth, and marks any absent entities (caught) as dying.
+ * - Orientation unavailable (or no context): falls back to the single overlay sloth.
  *
  * Skipped while a WebXR immersive session is in progress.
  */
-function buildSlothField(): void {
-  if (renderer?.xr.isPresenting) return; // WebXR manages its own sloth
-
-  // Tear down the previous field
-  if (slothField != null) {
-    scene.remove(slothField);
-    disposeGroup(slothField);
-    slothField = null;
-  }
+function syncSlothField(): void {
+  if (renderer?.xr.isPresenting) return;
 
   if (!orientationAvailable || geoCtx == null || geoCtx.sloths.length === 0) {
+    // Fallback: show single overlay sloth, hide field
+    if (slothField != null) slothField.visible = false;
     placeSlothOverlay();
     return;
   }
 
-  // Hide the single overlay sloth — the field replaces it.
+  // Ensure field group exists
+  if (slothField == null) {
+    slothField = new THREE.Group();
+    scene.add(slothField);
+  }
+  slothField.visible = true;
   slothGroup.visible = false;
 
-  slothField = new THREE.Group();
+  // Build a set of ids currently in the geo snapshot
+  const incomingIds = new Set<number>(geoCtx.sloths.map((f) => f.properties.id));
 
+  // Mark entities absent from the snapshot as dying (= caught)
+  for (const [id, entity] of entityById) {
+    if (!incomingIds.has(id) && !(entity.userData['dying'] as boolean | undefined)) {
+      entity.userData['dying'] = true;
+      entity.userData['dyingElapsed'] = 0;
+      // Snapshot current model scale for the vanish animation
+      const model = entity.children[0];
+      entity.userData['originalScale'] = model != null ? model.scale.x : OVERLAY_SCALE;
+    }
+  }
+
+  // Upsert present sloths
   for (const f of geoCtx.sloths) {
     const [slothLng, slothLat] = f.geometry.coordinates as [number, number];
     const distM      = getDistanceM(geoCtx.lat, geoCtx.lng, slothLat, slothLng);
     const bearingDeg = getBearingDeg(geoCtx.lat, geoCtx.lng, slothLat, slothLng);
     const { x, z, sceneDist } = toScenePosition(distM, bearingDeg);
+    const scale = scaleForDistance(sceneDist);
 
-    const entity = new THREE.Group();
-    const scale   = scaleForDistance(sceneDist);
+    const existing = entityById.get(f.properties.id);
+    if (existing != null) {
+      // Update target position (position lerped in onFrame)
+      const tp = existing.userData['targetPos'] as THREE.Vector3;
+      tp.set(x, FIELD_Y, z);
+      existing.userData['originalScale'] = scale;
 
-    const model = createSloth();
-    model.scale.setScalar(scale);
-    model.userData['phase'] = Math.random() * Math.PI * 2;
-    entity.add(model);
+      // Update model scale to reflect new distance
+      const model = existing.children[0];
+      if (model != null) model.scale.setScalar(scale);
 
-    // Label: distance-proportional size so it always subtends ~3.4° on screen.
-    // Canvas aspect ratio is 128:36 ≈ 3.56.
-    const labelW = sceneDist * 0.06;
-    const label  = makeLabelSprite(`${Math.round(distM)} m`);
-    label.position.set(0, 1.28 * scale + 0.08, 0); // just above sloth head
-    label.scale.set(labelW, labelW / 3.56, 1);
-    entity.add(label);
-
-    entity.position.set(x, FIELD_Y, z);
-    slothField.add(entity);
+      // Rebuild label if the metre-rounded distance changed
+      const roundedDist = Math.round(distM);
+      if ((existing.userData['lastDistM'] as number | undefined) !== roundedDist) {
+        existing.userData['lastDistM'] = roundedDist;
+        const oldLabel = existing.children[1];
+        if (oldLabel instanceof THREE.Sprite) {
+          oldLabel.material.map?.dispose();
+          oldLabel.material.dispose();
+          existing.remove(oldLabel);
+        }
+        const labelW    = sceneDist * 0.06;
+        const newLabel  = makeLabelSprite(`${roundedDist} m`);
+        newLabel.position.set(0, 1.28 * scale + 0.08, 0);
+        newLabel.scale.set(labelW, labelW / 3.56, 1);
+        existing.add(newLabel);
+      }
+    } else {
+      const entity = buildEntity(f, distM, bearingDeg, sceneDist, scale);
+      entityById.set(f.properties.id, entity);
+      slothField.add(entity);
+    }
   }
+}
 
-  scene.add(slothField);
+/** Create a new geo-anchored sloth entity for the given sloth feature. */
+function buildEntity(
+  f: SlothFeature,
+  distM: number,
+  bearingDeg: number,
+  sceneDist: number,
+  scale: number,
+): THREE.Group {
+  const { x, z } = toScenePosition(distM, bearingDeg); // sceneDist already computed
+  // (toScenePosition used again only to retrieve x,z — sceneDist is passed in)
+  _targetPos.set(x, FIELD_Y, z);
+
+  const entity = new THREE.Group();
+  entity.userData['slothId']      = f.properties.id;
+  entity.userData['targetPos']    = _targetPos.clone();
+  entity.userData['originalScale'] = scale;
+  entity.userData['lastDistM']    = Math.round(distM);
+  entity.position.copy(_targetPos); // snap to position on creation
+
+  const model = createSloth();
+  model.scale.setScalar(scale);
+  model.userData['phase'] = Math.random() * Math.PI * 2;
+  entity.add(model);
+
+  const labelW = sceneDist * 0.06;
+  const label  = makeLabelSprite(`${Math.round(distM)} m`);
+  label.position.set(0, 1.28 * scale + 0.08, 0);
+  label.scale.set(labelW, labelW / 3.56, 1);
+  entity.add(label);
+
+  return entity;
 }
 
 /** Create a canvas-texture distance label that always faces the camera. */
@@ -377,7 +496,7 @@ function onARSessionEnd(): void {
   arHintEl.classList.add('hidden');
 
   // Restore overlay / geo field
-  buildSlothField();
+  syncSlothField();
   void startCamera(); // restart getUserMedia stream after WebXR releases camera
 }
 

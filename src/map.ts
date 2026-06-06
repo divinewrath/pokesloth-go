@@ -1,7 +1,7 @@
 import maplibregl, { type StyleImageInterface } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { getElement } from './dom.js';
-import { checkProximity, resetProximityState } from './proximity.js';
+import { detectCatches, resetProximityState, signalCatch } from './proximity.js';
 import type { GeoContext, SlothFeature } from './types.js';
 import { DEFAULT_LAT, DEFAULT_LNG, SLOTH_SPAWN_COUNT } from './types.js';
 
@@ -17,8 +17,20 @@ let slothFeatures: SlothFeature[] = [];
 let playerLat = DEFAULT_LAT;
 let playerLng = DEFAULT_LNG;
 
+// Catch progress counters — reset whenever sloths are respawned.
+let caughtCount  = 0;
+let totalSpawned = 0;
+
+// Callback set by the caller — pushed on every GPS tick so AR stays live.
+let onGeoUpdateCallback: (ctx: GeoContext) => void = () => { /* wired in initMap */ };
+
 /** Initialise the MapLibre map. Call once the map-screen element is visible. */
-export function initMap(onSlothEncounter: (ctx: GeoContext) => void): void {
+export function initMap(
+  onSlothEncounter: (ctx: GeoContext) => void,
+  onGeoUpdate: (ctx: GeoContext) => void,
+): void {
+  onGeoUpdateCallback = onGeoUpdate;
+
   map = new maplibregl.Map({
     container: 'map',
     style:     'https://tiles.openfreemap.org/styles/liberty',
@@ -121,7 +133,8 @@ function setupSlothLayer(m: maplibregl.Map): void {
     data: { type: 'FeatureCollection', features: [] },
   });
 
-  // Golden aura behind nearby sloths — circle layer filtered to nearby: true
+  // Golden aura behind approaching sloths — circle layer filtered to nearby: true.
+  // "nearby" is now set when within APPROACH_RADIUS_M (30 m) as a warm cue.
   m.addLayer({
     id:     'sloths-aura',
     type:   'circle',
@@ -151,6 +164,9 @@ function setupSlothLayer(m: maplibregl.Map): void {
 }
 
 function spawnSloths(centerLng: number, centerLat: number, count = SLOTH_SPAWN_COUNT): void {
+  caughtCount  = 0;
+  totalSpawned = count;
+
   slothFeatures = Array.from({ length: count }, (_, i): SlothFeature => ({
     type: 'Feature',
     geometry: {
@@ -164,19 +180,22 @@ function spawnSloths(centerLng: number, centerLat: number, count = SLOTH_SPAWN_C
   }));
 
   setSlothData(slothFeatures);
-  slothBadgeEl.textContent = `🦥 ${slothFeatures.length}`;
+  updateBadge();
 }
 
 function clearSloths(): void {
   slothFeatures = [];
   resetProximityState();
   setSlothData([]);
-  slothBadgeEl.textContent = '🦥 0';
 }
 
 function setSlothData(features: SlothFeature[]): void {
   (map?.getSource('sloths') as maplibregl.GeoJSONSource | undefined)
     ?.setData({ type: 'FeatureCollection', features });
+}
+
+function updateBadge(): void {
+  slothBadgeEl.textContent = `🦥 ${caughtCount}/${totalSpawned}`;
 }
 
 function onGPSUpdate(pos: GeolocationPosition): void {
@@ -186,8 +205,20 @@ function onGPSUpdate(pos: GeolocationPosition): void {
   playerMarker?.setLngLat([lng, lat]);
   gpsPillEl.textContent = `📍 ${lat.toFixed(5)}, ${lng.toFixed(5)}`;
 
-  slothFeatures = checkProximity(lat, lng, slothFeatures);
-  setSlothData(slothFeatures);
+  // Check catches BEFORE the first-GPS respawn so default sloths can't be caught.
+  if (mapCentered) {
+    const { remaining, caught } = detectCatches(lat, lng, slothFeatures);
+    if (caught.length > 0) {
+      caughtCount += caught.length;
+      updateBadge();
+      signalCatch(caught.length);
+    }
+    slothFeatures = remaining;
+    setSlothData(slothFeatures);
+
+    // Push live geo snapshot to the AR view (no-op if AR not open).
+    onGeoUpdateCallback({ lat, lng, sloths: slothFeatures });
+  }
 
   if (!mapCentered) {
     mapCentered = true;
