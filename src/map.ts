@@ -2,7 +2,7 @@ import maplibregl, { type StyleImageInterface } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { getElement } from './dom.js';
 import { checkProximity, resetProximityState } from './proximity.js';
-import type { SlothFeature } from './types.js';
+import type { GeoContext, SlothFeature } from './types.js';
 import { DEFAULT_LAT, DEFAULT_LNG, SLOTH_SPAWN_COUNT } from './types.js';
 
 const gpsPillEl    = getElement<HTMLDivElement>('gps-pill');
@@ -13,8 +13,12 @@ let playerMarker: maplibregl.Marker | null = null;
 let mapCentered  = false;
 let slothFeatures: SlothFeature[] = [];
 
+// Player position — seeded with fallback, updated on each GPS fix.
+let playerLat = DEFAULT_LAT;
+let playerLng = DEFAULT_LNG;
+
 /** Initialise the MapLibre map. Call once the map-screen element is visible. */
-export function initMap(onSlothEncounter: () => void): void {
+export function initMap(onSlothEncounter: (ctx: GeoContext) => void): void {
   map = new maplibregl.Map({
     container: 'map',
     style:     'https://tiles.openfreemap.org/styles/liberty',
@@ -32,7 +36,9 @@ export function initMap(onSlothEncounter: () => void): void {
 
   map.on('load', () => {
     setupSlothLayer(map!); // map is non-null: we're inside its own 'load' handler
-    map!.on('click',      'sloths', () => onSlothEncounter());
+    map!.on('click', 'sloths', () =>
+      onSlothEncounter({ lat: playerLat, lng: playerLng, sloths: slothFeatures }),
+    );
     map!.on('mouseenter', 'sloths', () => { map!.getCanvas().style.cursor = 'pointer'; });
     map!.on('mouseleave', 'sloths', () => { map!.getCanvas().style.cursor = '';        });
     spawnSloths(DEFAULT_LNG, DEFAULT_LAT);
@@ -175,6 +181,8 @@ function setSlothData(features: SlothFeature[]): void {
 
 function onGPSUpdate(pos: GeolocationPosition): void {
   const { latitude: lat, longitude: lng } = pos.coords;
+  playerLat = lat;
+  playerLng = lng;
   playerMarker?.setLngLat([lng, lat]);
   gpsPillEl.textContent = `📍 ${lat.toFixed(5)}, ${lng.toFixed(5)}`;
 
