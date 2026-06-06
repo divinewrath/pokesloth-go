@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>PokeSloth Go!</title>
+  <script type="module" src="/src/main.ts"></script>
+</head>
+<body>
+
+<!-- ═══════════════ TITLE SCREEN ═══════════════ -->
+<div id="title-screen">
+  <div class="title-content">
+    <div class="sloth-deco">🦥</div>
+    <h1>PokeSloth Go!</h1>
+    <p class="tagline">Catch 'em all… eventually.</p>
+    <button id="start-btn">▶&nbsp; Start</button>
+  </div>
+</div>
+
+<!-- ═══════════════ MAP SCREEN ═══════════════ -->
+<div id="map-screen" class="hidden">
+  <div id="map"></div>
+  <div id="map-hud">
+    <div id="gps-pill">📍 Locating…</div>
+    <div id="sloth-badge">🦥 0</div>
+    <div id="nearby-toast" class="hidden">🦥 Sloth nearby! Tap to encounter</div>
+  </div>
+</div>
+
+<!-- ═══════════════ AR / CAMERA SCREEN ═══════════════ -->
+<div id="game-screen" class="hidden">
+  <video id="camera" autoplay playsinline muted></video>
+  <canvas id="three-canvas"></canvas>
+  <div id="hud">
+    <button id="back-btn">← Map</button>
+    <div id="camera-error" class="hidden">📵 Camera unavailable — sloth dropped in anyway!</div>
+    <div id="ar-hint"      class="hidden">Point at a flat surface, then tap to place</div>
+  </div>
+</div>
+
+</body>
+</html>
